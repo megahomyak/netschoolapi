@@ -10,13 +10,17 @@ from netschoolapi import data, errors, schemas
 __all__ = ['NetSchoolAPI']
 
 
+async def _die_on_bad_status(response: Response):
+    response.raise_for_status()
+
+
 class NetSchoolAPI:
     def __init__(self, url: str):
         url = url.rstrip('/')
         self._client = AsyncClient(
             base_url=f'{url}/webapi',
             headers={'user-agent': 'NetSchoolAPI/5.0.3', 'referer': url},
-            event_hooks={'response': [self._relogin_if_logged_out]},
+            event_hooks={'response': [_die_on_bad_status]},
         )
 
         self._student_id = -1
@@ -31,24 +35,6 @@ class NetSchoolAPI:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.logout()
-
-    async def _relogin_if_logged_out(self, response: Response):
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as http_status_error:
-            if (
-                self._login_data
-                and (
-                    http_status_error.response.status_code
-                    == httpx.codes.UNAUTHORIZED
-                )
-            ):
-                await self.login(*self._login_data)
-                return await self._client.send(response.request)
-            else:
-                raise http_status_error
-        else:
-            return response
 
     async def login(self, user_name: str, password: str, school: str):
         response_with_cookies = await self._client.get('logindata')
@@ -101,6 +87,22 @@ class NetSchoolAPI:
         }
         self._login_data = (user_name, password, school)
 
+    async def _request_with_optional_relogin(
+            self, path: str, method="GET", params: dict = None,
+            json: dict = None):
+        while True:
+            try:
+                response = await self._client.request(
+                    method, path, params=params, json=json
+                )
+            except httpx.HTTPStatusError:
+                if self._login_data:
+                    await self.login(*self._login_data)
+                else:
+                    raise
+            else:
+                return response
+
     async def diary(
         self,
         start: Optional[date] = None,
@@ -112,7 +114,7 @@ class NetSchoolAPI:
         if not end:
             end = start + timedelta(days=5)
 
-        response = await self._client.get(
+        response = await self._request_with_optional_relogin(
             'student/diary',
             params={
                 'studentId': self._student_id,
@@ -136,7 +138,7 @@ class NetSchoolAPI:
         if not end:
             end = start + timedelta(days=5)
 
-        response = await self._client.get(
+        response = await self._request_with_optional_relogin(
             'student/diary/pastMandatory',
             params={
                 'studentId': self._student_id,
@@ -150,7 +152,7 @@ class NetSchoolAPI:
 
     async def announcements(
             self, take: Optional[int] = -1) -> List[data.Announcement]:
-        response = await self._client.get(
+        response = await self._request_with_optional_relogin(
             'announcements', params={'take': take}
         )
         announcements = schemas.Announcement().load(response.json(), many=True)
@@ -161,8 +163,9 @@ class NetSchoolAPI:
 
     async def attachments(
             self, assignment: data.Assignment) -> List[data.Attachment]:
-        response = await self._client.post(
-            'student/diary/get-attachments',
+        response = await self._request_with_optional_relogin(
+            method="POST",
+            path='student/diary/get-attachments',
             params={'studentId': self._student_id},
             json={'assignId': [assignment.id]},
         )
@@ -171,7 +174,7 @@ class NetSchoolAPI:
         return [data.Attachment(**attachment) for attachment in attachments]
 
     async def school(self):
-        response = await self._client.get(
+        response = await self._request_with_optional_relogin(
             'schools/{0}/card'.format(self._school_id)
         )
         school = schemas.School().load(response.json())
