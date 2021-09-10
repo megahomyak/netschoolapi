@@ -90,18 +90,26 @@ class NetSchoolAPI:
     async def _request_with_optional_relogin(
             self, path: str, method="GET", params: dict = None,
             json: dict = None):
-        while True:
-            try:
-                response = await self._client.request(
-                    method, path, params=params, json=json
+        try:
+            response = await self._client.request(
+                method, path, params=params, json=json
+            )
+        except httpx.HTTPStatusError as http_status_error:
+            if (
+                self._login_data
+                and (
+                    http_status_error.response.status_code
+                    == httpx.codes.UNAUTHORIZED
                 )
-            except httpx.HTTPStatusError:
-                if self._login_data:
-                    await self.login(*self._login_data)
-                else:
-                    raise
+            ):
+                await self.login(*self._login_data)
+                return await self._client.send(
+                    http_status_error.response.request
+                )
             else:
-                return response
+                raise
+        else:
+            return response
 
     async def diary(
         self,
