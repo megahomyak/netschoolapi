@@ -102,18 +102,21 @@ class NetSchoolAPI:
             )
         except httpx.HTTPStatusError as http_status_error:
             if (
-                self._login_data
-                and (
-                    http_status_error.response.status_code
-                    == httpx.codes.UNAUTHORIZED
-                )
+                http_status_error.response.status_code
+                == httpx.codes.UNAUTHORIZED
             ):
-                await self.login(*self._login_data)
-                return await self._client.send(
-                    http_status_error.response.request
-                )
+                if self._login_data:
+                    await self.login(*self._login_data)
+                    return await self._client.send(
+                        http_status_error.response.request
+                    )
+                else:
+                    raise errors.AuthError(
+                        ".login() before making requests that need "
+                        "authorization"
+                    )
             else:
-                raise
+                raise http_status_error
         else:
             return response
 
