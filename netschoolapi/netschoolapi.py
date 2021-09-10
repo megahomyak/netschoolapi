@@ -50,17 +50,23 @@ class NetSchoolAPI:
         pw2 = md5(salt.encode() + encoded_password).hexdigest()
         pw = pw2[: len(password)]
 
-        response = await self._client.post(
-            'login',
-            data={
-                'loginType': 1,
-                **(await self._address(school)),
-                'un': user_name,
-                'pw': pw,
-                'pw2': pw2,
-                **login_meta,
-            },
-        )
+        try:
+            response = await self._client.post(
+                'login',
+                data={
+                    'loginType': 1,
+                    **(await self._address(school)),
+                    'un': user_name,
+                    'pw': pw,
+                    'pw2': pw2,
+                    **login_meta,
+                },
+            )
+        except httpx.HTTPStatusError as http_status_error:
+            if http_status_error.response.status_code == httpx.codes.CONFLICT:
+                raise errors.AuthError("Incorrect username or password!")
+            else:
+                raise http_status_error
         auth_result = response.json()
 
         if 'at' not in auth_result:
