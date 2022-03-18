@@ -5,37 +5,32 @@ from typing import Optional, Dict, List, Union
 
 import httpx
 from httpx import AsyncClient, Response
+#from httpx.types import CookieTypes
 
 from netschoolapi import data, errors, schemas
 
 __all__ = ['NetSchoolAPI']
 
-from netschoolapi.async_client_wrapper import AsyncClientWrapper, Requester
 
 
 async def _die_on_bad_status(response: Response):
     response.raise_for_status()
-
+#/webapi
 
 class NetSchoolAPI:
-    def __init__(
-            self, url: str, default_requests_timeout: int = None):
+    def __init__(self, url: str):
         url = url.rstrip('/')
-        self._wrapped_client = AsyncClientWrapper(
-            async_client=AsyncClient(
-                base_url=f'{url}/webapi',
-                headers={'user-agent': 'NetSchoolAPI/5.0.3', 'referer': url},
-                event_hooks={'response': [_die_on_bad_status]},
-            ),
-            default_requests_timeout=default_requests_timeout,
+        self._client = AsyncClient(
+            base_url=f'{url}',
+            headers={'user-agent': 'NetSchoolApi', 'referer': url},
+            event_hooks={'response': [_die_on_bad_status]},
         )
-
         self._student_id = -1
         self._year_id = -1
         self._school_id = -1
-
         self._assignment_types: Dict[int, str] = {}
         self._login_data = ()
+        self._at=-1
 
     async def __aenter__(self) -> 'NetSchoolAPI':
         return self
@@ -43,18 +38,16 @@ class NetSchoolAPI:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.logout()
 
-    async def login(
-            self, user_name: str, password: str, school: str,
-            requests_timeout: int = None):
-        requester = self._wrapped_client.make_requester(requests_timeout)
-        response_with_cookies = await requester('logindata')
-        self._wrapped_client.client.cookies.extract_cookies(
-            response_with_cookies
-        )
-
-        response = await requester('auth/getdata', method="POST")
+    async def login(self, user_name: str, password: str, school_id: int):
+        response_with_cookies = await self._client.get('webapi/logindata')
+        self._client.cookies.extract_cookies(response_with_cookies)
+         
+     
+        response = await self._client.post('webapi/auth/getdata')
         login_meta = response.json()
         salt = login_meta.pop('salt')
+        self._ver = login_meta['ver']
+
 
         encoded_password = md5(
             password.encode('windows-1251')
@@ -63,62 +56,99 @@ class NetSchoolAPI:
         pw = pw2[: len(password)]
 
         try:
-            response = await requester(
-                'login',
+            response = await self._client.post(
+                '/webapi/login',
                 data={
                     'loginType': 1,
-                    **(await self._address(school, requester)),
+                    **(await self._address(school_id)),
                     'un': user_name,
                     'pw': pw,
                     'pw2': pw2,
                     **login_meta,
                 },
-                method="POST"
+                headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.81 Safari/537.36",
+                "Accept":"application/json, text/javascript, */*; q=0.01",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Connection": "keep-alive"
+                }
+                
             )
         except httpx.HTTPStatusError as http_status_error:
+            await self._client.post('webapi/auth/logout')
+            await self._client.aclose()
             if http_status_error.response.status_code == httpx.codes.CONFLICT:
-                response_json = http_status_error.response.json()
-                if 'message' in response_json:
-                    raise errors.AuthError(
-                        http_status_error.response.json()['message']
-                    )
-                else:
-                    raise http_status_error
+                raise errors.AuthError("Incorrect username or password!")
             else:
                 raise http_status_error
+                
         auth_result = response.json()
+      
 
         if 'at' not in auth_result:
             raise errors.AuthError(auth_result['message'])
+    
+        self._client.headers['AT'] = auth_result['at']
+        self._at=auth_result['at']
+     
 
-        self._wrapped_client.client.headers['at'] = auth_result['at']
-
-        response = await requester('student/diary/init')
+        response = await self._client.get('webapi/student/diary/init')
         diary_info = response.json()
+    
         student = diary_info['students'][diary_info['currentStudentId']]
         self._student_id = student['studentId']
+        self._class_id = student['classId']
+        self._school_id = school_id
+    
+        
 
-        response = await requester('years/current')
+        response = await self._client.get('webapi/years/current')
         year_reference = response.json()
-        self._year_id = year_reference['id']
-
-        response = await requester(
-            'grade/assignment/types', params={'all': False}
+        self._year_id = year_reference['id']    
+        response = await self._client.get(
+            'webapi/grade/assignment/types', params={'all': False}
         )
         assignment_reference = response.json()
+
         self._assignment_types = {
             assignment['id']: assignment['name']
             for assignment in assignment_reference
         }
-        self._login_data = (user_name, password, school)
+
+
+        self._login_data = (user_name, password, school_id)
+
+    #данные по моей школе
+    async def school(self):
+        response = await self._request_with_optional_relogin(
+            'webapi/schools/{0}/card'.format(self._school_id)
+        )
+        return response.json()
+
+    #получаем список школ
+    async def schools(self):
+        response = await self._client.get(
+            'webapi/addresses/schools', params={'funcType': 2}
+        )
+        return response.json()
+
+
+    #получаем текущий период обучения
+    async def get_period(self):
+        response = await self._client.get(
+            'webapi/reports/studenttotal'
+        )
+        return response.json()
 
     async def _request_with_optional_relogin(
-            self, requests_timeout: Optional[int], path: str,
-            method="GET", params: dict = None, json: dict = None):
+            self, path: str, method="GET", params: dict = None,
+            json: dict = None, cookies: httpx._types.CookieTypes=None,
+            headers:dict = None):
         try:
-            response = await self._wrapped_client.request(
-                requests_timeout, path, method, params, json,
-            )
+            response = await self._client.request(
+                method, path, params=params, json=json, cookies=cookies, headers=headers)
+            
         except httpx.HTTPStatusError as http_status_error:
             if (
                 http_status_error.response.status_code
@@ -126,23 +156,22 @@ class NetSchoolAPI:
             ):
                 if self._login_data:
                     await self.login(*self._login_data)
-                    return await self._request_with_optional_relogin(
-                        requests_timeout, path, method, params, json
+                    cookies = self._client.cookies.extract_cookies(response)
+                    return await self._client.request(
+                        method, path, params=params, json=json, cookies=cookies, headers=headers
                     )
                 else:
                     raise errors.AuthError(
-                        ".login() before making requests that need "
-                        "authorization"
                     )
             else:
                 raise http_status_error
         else:
             return response
 
+    #скачиваем прикреплённый файл
     async def download_attachment(
             self, attachment: data.Attachment,
-            path_or_file: Union[BytesIO, str] = None,
-            requests_timeout: int = None):
+            path_or_file: Union[BytesIO, str] = None):
         """
         If `path_to_file` is a string, it should contain absolute path to file
         """
@@ -154,26 +183,25 @@ class NetSchoolAPI:
             file = path_or_file
         file.write((
             await self._request_with_optional_relogin(
-                requests_timeout,
-                f"attachments/{attachment.id}",
+                f"attachments/{attachment.id}"
             )
         ).content)
 
+
+    #получаем прикреплённый файл
     async def download_attachment_as_bytes(
-            self, attachment: data.Attachment, requests_timeout: int = None,
-    ) -> BytesIO:
+            self, attachment: data.Attachment) -> BytesIO:
         attachment_contents_buffer = BytesIO()
         await self.download_attachment(
-            attachment, path_or_file=attachment_contents_buffer,
-            requests_timeout=requests_timeout
+            attachment, path_or_file=attachment_contents_buffer
         )
         return attachment_contents_buffer
 
+    #получаем весь дневник
     async def diary(
         self,
         start: Optional[date] = None,
         end: Optional[date] = None,
-        requests_timeout: int = None,
     ) -> data.Diary:
         if not start:
             monday = date.today() - timedelta(days=date.today().weekday())
@@ -182,8 +210,7 @@ class NetSchoolAPI:
             end = start + timedelta(days=5)
 
         response = await self._request_with_optional_relogin(
-            requests_timeout,
-            'student/diary',
+            'webapi/student/diary',
             params={
                 'studentId': self._student_id,
                 'yearId': self._year_id,
@@ -191,15 +218,12 @@ class NetSchoolAPI:
                 'weekEnd': end.isoformat(),
             },
         )
-        diary_schema = schemas.Diary()
-        diary_schema.context['assignment_types'] = self._assignment_types
-        return data.diary(diary_schema.load(response.json()))
+        return response.json()
 
     async def overdue(
         self,
         start: Optional[date] = None,
         end: Optional[date] = None,
-        requests_timeout: int = None,
     ) -> List[data.Assignment]:
         if not start:
             monday = date.today() - timedelta(days=date.today().weekday())
@@ -208,8 +232,7 @@ class NetSchoolAPI:
             end = start + timedelta(days=5)
 
         response = await self._request_with_optional_relogin(
-            requests_timeout,
-            'student/diary/pastMandatory',
+            'webapi/student/diary/pastMandatory',
             params={
                 'studentId': self._student_id,
                 'yearId': self._year_id,
@@ -217,87 +240,166 @@ class NetSchoolAPI:
                 'weekEnd': end.isoformat(),
             },
         )
-        assignments_schema = schemas.Assignment()
-        assignments_schema.context['assignment_types'] = self._assignment_types
-        assignments = assignments_schema.load(response.json(), many=True)
+        assignments = schemas.Assignment().load(response.json(), many=True)
         return [data.Assignment(**assignment) for assignment in assignments]
 
     async def announcements(
-            self, take: Optional[int] = -1,
-            requests_timeout: int = None) -> List[data.Announcement]:
+            self, take: Optional[int] = -1) -> List[dict]:
         response = await self._request_with_optional_relogin(
-            requests_timeout,
-            'announcements',
-            params={'take': take},
+            '/announcements', params={'take': take}
         )
-        announcements = schemas.Announcement().load(response.json(), many=True)
-        return [
-            data.announcement(announcement)
-            for announcement in announcements
-        ]
+
+     
+        return response.json()
+
+
+    async def get_assign(self, id_assign:int) -> List[dict]:
+        response = await self._client.get(
+            url='webapi/student/diary/assigns/'+str(id_assign), 
+            params={'studentId': self._student_id}
+        )
+        return response.json()
+    
 
     async def attachments(
-            self, assignment: data.Assignment,
-            requests_timeout: int = None) -> List[data.Attachment]:
+            self, assignment: data.Assignment) -> List[data.Attachment]:
         response = await self._request_with_optional_relogin(
-            requests_timeout,
             method="POST",
             path='student/diary/get-attachments',
             params={'studentId': self._student_id},
             json={'assignId': [assignment.id]},
         )
-        response = response.json()
-        if not response:
-            return []
-        attachments_json = response[0]['attachments']
+        attachments_json = response.json()[0]['attachments']
+
         attachments = schemas.Attachment().load(attachments_json, many=True)
         return [data.Attachment(**attachment) for attachment in attachments]
 
-    async def school(self, requests_timeout: int = None):
-        response = await self._request_with_optional_relogin(
-            requests_timeout,
-            'schools/{0}/card'.format(self._school_id),
+
+    async def logout(self):
+        await self._client.post('webapi/auth/logout')
+        await self._client.aclose()
+
+    async def _address(self, school_id: int) -> Dict[str, int]:
+        response = await self._client.get(
+            'webapi/addresses/schools', params={"id": school_id}
         )
-        school = schemas.School().load(response.json())
-        return data.School(**school)
-
-    async def logout(self, requests_timeout: int = None):
-        try:
-            await self._wrapped_client.request(
-                requests_timeout,
-                'auth/logout',
-                method="POST",
-            )
-        except httpx.HTTPStatusError as http_status_error:
-            if (
-                http_status_error.response.status_code
-                == httpx.codes.UNAUTHORIZED
-            ):
-                # Session is dead => we are logged out already
-                # OR
-                # We are logged out already
-                pass
-            else:
-                raise http_status_error
-
-    async def full_logout(self, requests_timeout: int = None):
-        await self.logout(requests_timeout)
-        await self._wrapped_client.client.aclose()
-
-    async def _address(
-            self, school: str, requester: Requester) -> Dict[str, int]:
-        response = await requester('addresses/schools', params={'funcType': 2})
-
-        schools_reference = response.json()
-        for school_ in schools_reference:
-            if school_['name'] == school or school_['id'] == school:
-                self._school_id = school_['id']
-                return {
-                    'cid': school_['countryId'],
-                    'sid': school_['stateId'],
-                    'pid': school_['municipalityDistrictId'],
-                    'cn': school_['cityId'],
-                    'sft': 2,
-                    'scid': school_['id'],
-                }
+        school = response.json()
+        school = school[0]
+        return {
+            'cid': school['countryId'],
+            'sid': school['stateId'],
+            'pid': school['municipalityDistrictId'],
+            'cn': school['cityId'],
+            'sft': 2,
+            'scid': school['id'],
+        }
         raise errors.SchoolNotFoundError(school)
+
+
+    async def get_total_marks_from_report(self):
+        response_with_cookies = await self._client.post(
+            url='asp/Reports/ReportStudentTotalMarks.asp',
+            data = {
+                'AT': self._at,
+                'VER': self._ver,
+                'RPNAME': 'Итоговые отметки',
+                'RPTID': 'StudentTotalMarks',      
+            })
+
+        self._client.cookies.extract_cookies(response_with_cookies) 
+
+        response = await self._client.post(
+            url='asp/Reports/StudentTotalMarks.asp',
+            data = {
+                'AT': self._at,
+                'VER': self._ver,
+                'LoginType': '0',
+                'RPTID' :'StudentTotalMarks',
+                'SID': self._student_id,
+                'PCLID': self._class_id,
+            })
+        response_file = await self._client.get('static/dist/pages/common/css/export-tables.min.css')
+        return response.text, response_file.text
+
+
+    async def get_parrentInfoLetter_from_report(self):
+        response_with_cookies = await self._client.post(
+            url='/asp/Reports/ReportParentInfoLetter.asp',
+            data = {
+                'AT': self._at,
+                'VER': self._ver,
+                'RPNAME': 'Информационное письмо для родителей',
+                'RPTID': 'ParentInfoLetter'
+            })
+        self._client.cookies.extract_cookies(response_with_cookies) 
+
+        response = await self._client.post(
+            url='asp/Reports/ParentInfoLetter.asp',
+            data = {
+                'AT': self._at,
+                'VER': self._ver,
+                'LoginType': '0',
+                'RPTID' :'ParentInfoLetter',
+                'SID': self._student_id,
+                'PCLID': self._class_id,
+                'ReportType':'2',
+                'TERMID': 26904
+            })
+        response_file = await self._client.get('static/dist/pages/common/css/export-tables.min.css')
+
+        return response.text, response_file.text
+
+
+
+    async def get_average_mark_from_Report(self, start, end):
+        response_with_cookies = await self._client.post(
+            url='/asp/Reports/ReportStudentAverageMark.asp',
+            data = {
+                'AT': self._at,
+                'VER': self._ver,
+                'RPNAME': 'Средний балл',
+                'RPTID': 'StudentAverageMark'
+            })
+        self._client.cookies.extract_cookies(response_with_cookies) 
+
+        response = await self._client.post(
+            url='asp/Reports/StudentAverageMark.asp',
+            data = {
+                'AT': self._at,
+                'VER': self._ver,
+                'LoginType': '0',
+                'RPTID' :'StudentAverageMark',
+                'SID': self._student_id,
+                'PCLID': self._class_id,
+                'ADT': start,
+                'DDT': end
+            })
+        response_file = await self._client.get('static/dist/pages/common/css/export-tables.min.css')
+
+        return response.text, response_file.text
+
+            
+    async def get_average_mark_dynamic_from_Report(self, start, end):
+        response_with_cookies = await self._client.post(
+            url='asp/Reports/ReportStudentAverageMarkDyn.asp',
+            data = {
+                'AT': self._at,
+                'VER': self._ver,
+                'RPNAME': 'Динамика среднего балла',
+                'RPTID': 'StudentAverageMarkDyn',
+            })
+        self._client.cookies.extract_cookies(response_with_cookies) 
+     
+        response = await self._client.post(
+            url='asp/Reports/StudentAverageMarkDyn.asp',
+            data = {
+                'AT': self._at,
+                'VER': self._ver,
+                'LoginType': '0',
+                'RPTID' :'StudentAverageMarkDyn',
+                'SID': self._student_id,
+                'ADT': start,
+                'DDT': end
+            })
+        response_file = await self._client.get('static/dist/pages/common/css/export-tables.min.css')
+        return response.text, response_file.text
