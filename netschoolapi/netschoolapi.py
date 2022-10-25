@@ -166,6 +166,7 @@ class NetSchoolAPI:
             attachment, path_or_file=attachment_contents_buffer,
             requests_timeout=requests_timeout
         )
+        attachment_contents_buffer.seek(0)
         return attachment_contents_buffer
 
     async def diary(
